@@ -2,18 +2,18 @@ import enum
 import functools
 import logging
 import math
+import os
 import time
+from pathlib import Path
 from typing import Callable, Optional, ParamSpec, TypeVar
 
 import openai
 import tiktoken
+import yaml
 from openai.error import APIError, RateLimitError
+from pydantic import SecretStr
 
-from autogpt.core.configuration import (
-    Configurable,
-    SystemConfiguration,
-    UserConfigurable,
-)
+from autogpt.core.configuration import Configurable, UserConfigurable
 from autogpt.core.resource.model_providers.schema import (
     AssistantChatMessageDict,
     AssistantToolCallDict,
@@ -27,6 +27,7 @@ from autogpt.core.resource.model_providers.schema import (
     EmbeddingModelProvider,
     EmbeddingModelResponse,
     ModelProviderBudget,
+    ModelProviderConfiguration,
     ModelProviderCredentials,
     ModelProviderName,
     ModelProviderService,
@@ -163,8 +164,71 @@ OPEN_AI_MODELS = {
 }
 
 
-class OpenAIConfiguration(SystemConfiguration):
-    retries_per_request: int = UserConfigurable()
+class OpenAIConfiguration(ModelProviderConfiguration):
+    fix_failed_parse_tries: int = UserConfigurable(3)
+    pass
+
+
+class OpenAICredentials(ModelProviderCredentials):
+    """Credentials for OpenAI."""
+
+    api_key: SecretStr = UserConfigurable(from_env="OPENAI_API_KEY")
+    api_base: Optional[SecretStr] = UserConfigurable(
+        default=None, from_env="OPENAI_API_BASE_URL"
+    )
+    organization: Optional[SecretStr] = UserConfigurable(from_env="OPENAI_ORGANIZATION")
+
+    api_type: str = UserConfigurable(
+        default="",
+        from_env=lambda: (
+            "azure"
+            if os.getenv("USE_AZURE") == "True"
+            else os.getenv("OPENAI_API_TYPE")
+        ),
+    )
+    api_version: str = UserConfigurable("", from_env="OPENAI_API_VERSION")
+    azure_model_to_deploy_id_map: Optional[dict[str, str]] = None
+
+    def get_api_access_kwargs(self, model: str = "") -> dict[str, str]:
+        credentials = {k: v for k, v in self.unmasked().items() if type(v) is str}
+        if self.api_type == "azure" and model:
+            azure_credentials = self._get_azure_access_kwargs(model)
+            credentials.update(azure_credentials)
+        return credentials
+
+    def load_azure_config(self, config_file: Path) -> None:
+        with open(config_file) as file:
+            config_params = yaml.load(file, Loader=yaml.FullLoader) or {}
+
+        try:
+            assert (
+                azure_api_base := config_params.get("azure_api_base", "")
+            ) != "", "Azure API base URL not set"
+            assert config_params.get(
+                "azure_model_map", {}
+            ), "Azure model->deployment_id map is empty"
+        except AssertionError as e:
+            raise ValueError(*e.args)
+
+        self.api_base = SecretStr(azure_api_base)
+        self.api_type = config_params.get("azure_api_type", "azure")
+        self.api_version = config_params.get("azure_api_version", "")
+        self.azure_model_to_deploy_id_map = config_params.get("azure_model_map")
+
+    def _get_azure_access_kwargs(self, model: str) -> dict[str, str]:
+        """Get the kwargs for the Azure API."""
+
+        if not self.azure_model_to_deploy_id_map:
+            raise ValueError("Azure model deployment map not configured")
+
+        if model not in self.azure_model_to_deploy_id_map:
+            raise ValueError(f"No Azure deployment ID configured for model '{model}'")
+        deployment_id = self.azure_model_to_deploy_id_map[model]
+
+        if model in OPEN_AI_EMBEDDING_MODELS:
+            return {"engine": deployment_id}
+        else:
+            return {"deployment_id": deployment_id}
 
 
 class OpenAIModelProviderBudget(ModelProviderBudget):
@@ -174,7 +238,7 @@ class OpenAIModelProviderBudget(ModelProviderBudget):
 
 class OpenAISettings(ModelProviderSettings):
     configuration: OpenAIConfiguration
-    credentials: ModelProviderCredentials
+    credentials: Optional[OpenAICredentials]
     budget: OpenAIModelProviderBudget
 
 
@@ -187,7 +251,7 @@ class OpenAIProvider(
         configuration=OpenAIConfiguration(
             retries_per_request=10,
         ),
-        credentials=ModelProviderCredentials(),
+        credentials=None,
         budget=OpenAIModelProviderBudget(
             total_budget=math.inf,
             total_cost=0.0,
@@ -202,11 +266,14 @@ class OpenAIProvider(
         ),
     )
 
+    _configuration: OpenAIConfiguration
+
     def __init__(
         self,
         settings: OpenAISettings,
         logger: logging.Logger,
     ):
+        assert settings.credentials, "Cannot create OpenAIProvider without credentials"
         self._configuration = settings.configuration
         self._credentials = settings.credentials
         self._budget = settings.budget
@@ -266,7 +333,7 @@ class OpenAIProvider(
         try:
             encoding = tiktoken.encoding_for_model(encoding_model)
         except KeyError:
-            cls._logger.warn(
+            cls._logger.warning(
                 f"Model {model_name} not found. Defaulting to cl100k_base encoding."
             )
             encoding = tiktoken.get_encoding("cl100k_base")
@@ -297,24 +364,45 @@ class OpenAIProvider(
             model_prompt += completion_kwargs["messages"]
             del completion_kwargs["messages"]
 
-        response = await self._create_chat_completion(
-            messages=model_prompt,
-            **completion_kwargs,
-        )
-        response_args = {
-            "model_info": OPEN_AI_CHAT_MODELS[model_name],
-            "prompt_tokens_used": response.usage.prompt_tokens,
-            "completion_tokens_used": response.usage.completion_tokens,
-        }
-
-        response_message = response.choices[0].message.to_dict_recursive()
-        if tool_calls_compat_mode:
-            response_message["tool_calls"] = _tool_calls_compat_extract_calls(
-                response_message["content"]
+        attempts = 0
+        while True:
+            response = await self._create_chat_completion(
+                messages=model_prompt,
+                **completion_kwargs,
             )
+            response_args = {
+                "model_info": OPEN_AI_CHAT_MODELS[model_name],
+                "prompt_tokens_used": response.usage.prompt_tokens,
+                "completion_tokens_used": response.usage.completion_tokens,
+            }
+
+            response_message = response.choices[0].message.to_dict_recursive()
+            if tool_calls_compat_mode:
+                response_message["tool_calls"] = _tool_calls_compat_extract_calls(
+                    response_message["content"]
+                )
+
+            # If parsing the response fails, append the error to the prompt, and let the
+            # LLM fix its mistake(s).
+            try:
+                attempts += 1
+                parsed_response = completion_parser(response_message)
+                break
+            except Exception as e:
+                self._logger.warning(f"Parsing attempt #{attempts} failed: {e}")
+                self._logger.debug(
+                    f"Parsing failed on response: '''{response_message}'''"
+                )
+                if attempts < self._configuration.fix_failed_parse_tries:
+                    model_prompt.append(
+                        ChatMessage.system(f"ERROR PARSING YOUR RESPONSE:\n\n{e}")
+                    )
+                else:
+                    raise
+
         response = ChatModelResponse(
             response=response_message,
-            parsed_result=completion_parser(response_message),
+            parsed_result=parsed_response,
             **response_args,
         )
         self._budget.update_usage_and_cost(response)
@@ -362,7 +450,7 @@ class OpenAIProvider(
         completion_kwargs = {
             "model": model_name,
             **kwargs,
-            **self._credentials.unmasked(),
+            **self._credentials.get_api_access_kwargs(model_name),
         }
 
         if functions:
@@ -379,6 +467,12 @@ class OpenAIProvider(
             else:
                 # Provide compatibility with older models
                 _functions_compat_fix_kwargs(functions, completion_kwargs)
+
+        if extra_headers := self._configuration.extra_request_headers:
+            if completion_kwargs.get("headers"):
+                completion_kwargs["headers"].update(extra_headers)
+            else:
+                completion_kwargs["headers"] = extra_headers.copy()
 
         return completion_kwargs
 
@@ -402,6 +496,12 @@ class OpenAIProvider(
             **kwargs,
             **self._credentials.unmasked(),
         }
+
+        if extra_headers := self._configuration.extra_request_headers:
+            if embedding_kwargs.get("headers"):
+                embedding_kwargs["headers"].update(extra_headers)
+            else:
+                embedding_kwargs["headers"] = extra_headers.copy()
 
         return embedding_kwargs
 
@@ -458,7 +558,7 @@ class _OpenAIRetryHandler:
     _retry_limit_msg = "Error: Reached rate limit, passing..."
     _api_key_error_msg = (
         "Please double check that you have setup a PAID OpenAI API Account. You can "
-        "read more here: https://docs.agpt.co/setup/#getting-an-api-key"
+        "read more here: https://docs.agpt.co/setup/#getting-an-openai-api-key"
     )
     _backoff_msg = "Error: API Bad gateway. Waiting {backoff} seconds..."
 
@@ -572,10 +672,12 @@ def count_openai_functions_tokens(
 ) -> int:
     """Returns the number of tokens taken up by a set of function definitions
 
-    Reference: https://community.openai.com/t/how-to-calculate-the-tokens-when-using-function-call/266573/18
+    Reference: https://community.openai.com/t/how-to-calculate-the-tokens-when-using-function-call/266573/18  # noqa: E501
     """
     return count_tokens(
-        f"# Tools\n\n## functions\n\n{format_function_specs_as_typescript_ns(functions)}"
+        "# Tools\n\n"
+        "## functions\n\n"
+        f"{format_function_specs_as_typescript_ns(functions)}"
     )
 
 
